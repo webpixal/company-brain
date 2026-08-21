@@ -4,17 +4,17 @@ A knowledge-base prototype: ask a question, get an answer grounded in
 internal docs with source citations. Built on Next.js/TypeScript to
 match Needletail's production stack (Next.js on Vercel).
 
+**Live demo:** https://company-brain-hazel-xi.vercel.app/
+
 ## Run locally
-```
-npm install
-npm run dev
-```
+
 Open http://localhost:3000
 
-Optional: copy `.env.example` to `.env.local` and set `ANTHROPIC_API_KEY`
-for generative (vs extractive) answers.
+Optional: copy `.env.example` to `.env.local` and set `GROQ_API_KEY`
+(free) or `ANTHROPIC_API_KEY` for generative (vs extractive) answers.
 
 ## Structure
+
 - `lib/brain.ts` — retrieval engine (hybrid TF-IDF + keyword boost) and
   answer generation, isolated from the API/UI layer so retrieval can be
   swapped for a real embedding model without touching either.
@@ -28,4 +28,6 @@ for generative (vs extractive) answers.
 See `WRITEUP.md` for the approach writeup.
 
 ## Deploy
-This is a standard Next.js app — deploys to Vercel with no config changes.
+
+Standard Next.js app — already deployed to Vercel with zero config
+changes required. Push to `main` and Vercel handles the rest.
