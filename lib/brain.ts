@@ -1,12 +1,9 @@
 /**
  * Company Brain - core engine (TypeScript port)
  *
- * Same design as the Python prototype: hybrid TF-IDF retrieval
- * (word-level + character n-gram + keyword-overlap boost), extractive
- * answers by default, generative via Claude if ANTHROPIC_API_KEY is set.
- *
- * Ported to Next.js/TypeScript to match Needletail's production stack
- * (Next.js on Vercel) rather than requiring a separate Python service.
+ * Hybrid TF-IDF retrieval (word-level + character n-gram + keyword-overlap
+ * boost), extractive answers by default, generative via Claude/Groq if a
+ * key is set.
  */
 import fs from "fs";
 import path from "path";
@@ -32,13 +29,30 @@ export interface AnswerResult {
 
 function loadAndChunkDocs(docsDir: string = DOCS_DIR): Chunk[] {
   const chunks: Chunk[] = [];
+
+  if (!fs.existsSync(docsDir)) {
+    console.error(`Company Brain: docs directory not found at ${docsDir}`);
+    return chunks;
+  }
+
   const files = fs
     .readdirSync(docsDir)
     .filter((f) => f.endsWith(".md"))
     .sort();
 
+  if (files.length === 0) {
+    console.warn(`Company Brain: no .md files found in ${docsDir}`);
+  }
+
   for (const file of files) {
-    const text = fs.readFileSync(path.join(docsDir, file), "utf-8");
+    let text: string;
+    try {
+      text = fs.readFileSync(path.join(docsDir, file), "utf-8");
+    } catch (err) {
+      console.error(`Company Brain: failed to read ${file}:`, err);
+      continue;
+    }
+
     const sections = text.split(/\n(?=##? )/);
 
     for (const rawSection of sections) {
@@ -73,6 +87,7 @@ function charNGrams(text: string, n = [3, 4, 5]): string[] {
   const clean = text.toLowerCase().replace(/\s+/g, " ").trim();
   const grams: string[] = [];
   for (const size of n) {
+    if (clean.length < size) continue; // avoid negative-length loop
     for (let i = 0; i <= clean.length - size; i++) {
       grams.push(clean.slice(i, i + size));
     }
@@ -152,6 +167,8 @@ export class CompanyBrain {
   }
 
   retrieve(query: string, topK = 3): RetrievedChunk[] {
+    if (this.chunks.length === 0) return [];
+
     const qWords = tokenizeWords(query);
     const qChars = charNGrams(query);
 
@@ -178,34 +195,44 @@ export class CompanyBrain {
   }
 
   async answer(query: string, topK = 3): Promise<AnswerResult> {
-    const results = this.retrieve(query, topK);
+    const trimmedQuery = query.trim();
+    if (!trimmedQuery) {
+      return {
+        query,
+        answer: "Please enter a question.",
+        sources: [],
+      };
+    }
+
+    const results = this.retrieve(trimmedQuery, topK);
 
     if (results.length === 0) {
       return {
-        query,
-        answer: "No relevant information found in the knowledge base for this query.",
+        query: trimmedQuery,
+        answer:
+          this.chunks.length === 0
+            ? "The knowledge base is empty — no documents were loaded. Check that lib/sample_docs contains .md files."
+            : "No relevant information found in the knowledge base for this query.",
         sources: [],
       };
     }
 
     // Provider priority: Groq (free) -> Anthropic (paid) -> extractive fallback.
-    // Groq checked first since it's the free option - if a GROQ_API_KEY
-    // is present, use it and skip Anthropic entirely (no cost).
     const groqKey = process.env.GROQ_API_KEY;
     const anthropicKey = process.env.ANTHROPIC_API_KEY;
     let answerText: string;
 
     if (groqKey) {
-      answerText = await this.generateWithGroq(query, results, groqKey);
+      answerText = await this.generateWithGroq(trimmedQuery, results, groqKey);
     } else if (anthropicKey) {
-      answerText = await this.generateWithClaude(query, results, anthropicKey);
+      answerText = await this.generateWithClaude(trimmedQuery, results, anthropicKey);
     } else {
       const top = results[0];
       answerText = `[Extractive mode — set GROQ_API_KEY (free) or ANTHROPIC_API_KEY for generative answers]\n\nBased on '${top.title}' (${top.source}):\n${top.text}`;
     }
 
     return {
-      query,
+      query: trimmedQuery,
       answer: answerText,
       sources: results.map((r) => ({
         source: r.source,
@@ -222,19 +249,14 @@ export class CompanyBrain {
     return `You are the Needletail Company Brain, an internal knowledge assistant. Answer the question using ONLY the context below. Cite which source you used. If the context doesn't fully answer it, say what's missing.\n\nContext:\n${context}\n\nQuestion: ${query}`;
   }
 
-  /**
-   * Free provider. Groq's free tier needs no card and has generous
-   * rate limits for a demo like this. OpenAI-compatible API shape.
-   * Get a key at https://console.groq.com/keys
-   * Model: openai/gpt-oss-120b (Groq deprecated the old llama-3.3-70b-versatile
-   * alias in June 2026 - see console.groq.com/docs/models for the current list).
-   */
   private async generateWithGroq(
     query: string,
     results: RetrievedChunk[],
     apiKey: string
   ): Promise<string> {
     const prompt = this.buildPrompt(query, results);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
     try {
       const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST",
@@ -247,7 +269,9 @@ export class CompanyBrain {
           max_tokens: 400,
           messages: [{ role: "user", content: prompt }],
         }),
+        signal: controller.signal,
       });
+      clearTimeout(timeout);
 
       const data = await res.json();
 
@@ -264,8 +288,9 @@ export class CompanyBrain {
       }
       return text;
     } catch (err) {
+      const isAbort = err instanceof Error && err.name === "AbortError";
       console.error("Groq API request failed:", err);
-      return `[Groq API request failed: ${String(err)}]\n\nFalling back to top match:\n${results[0].text}`;
+      return `[Groq API request ${isAbort ? "timed out" : "failed"}: ${String(err)}]\n\nFalling back to top match:\n${results[0].text}`;
     }
   }
 
@@ -277,6 +302,9 @@ export class CompanyBrain {
     const prompt = this.buildPrompt(query, results);
 
     try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
+
       const res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: {
@@ -289,13 +317,13 @@ export class CompanyBrain {
           max_tokens: 400,
           messages: [{ role: "user", content: prompt }],
         }),
+        signal: controller.signal,
       });
+      clearTimeout(timeout);
 
       const data = await res.json();
 
       if (!res.ok) {
-        // Surface the real error instead of silently returning "".
-        // Common causes: invalid/expired key, wrong model name, no credits.
         const msg = data?.error?.message || JSON.stringify(data);
         console.error("Claude API error:", res.status, msg);
         return `[Claude API error ${res.status}: ${msg}]\n\nFalling back to top match:\n${results[0].text}`;
@@ -312,8 +340,9 @@ export class CompanyBrain {
 
       return text;
     } catch (err) {
+      const isAbort = err instanceof Error && err.name === "AbortError";
       console.error("Claude API request failed:", err);
-      return `[Claude API request failed: ${String(err)}]\n\nFalling back to top match:\n${results[0].text}`;
+      return `[Claude API request ${isAbort ? "timed out" : "failed"}: ${String(err)}]\n\nFalling back to top match:\n${results[0].text}`;
     }
   }
 }
@@ -322,4 +351,9 @@ let brainInstance: CompanyBrain | null = null;
 export function getBrain(): CompanyBrain {
   if (!brainInstance) brainInstance = new CompanyBrain();
   return brainInstance;
+}
+
+/** Useful in dev/tests when sample_docs changes and you don't want a full restart. */
+export function resetBrain(): void {
+  brainInstance = null;
 }

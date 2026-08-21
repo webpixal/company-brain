@@ -14,13 +14,6 @@ interface QueryResponse {
   sources: Source[];
 }
 
-/**
- * Minimal markdown renderer for answer text: handles **bold**, "- " bullet
- * lists, and strips inline 【source】 brackets plus a trailing
- * "*Source: ...*" line, since sources are already shown in the dedicated
- * Sources panel. Avoids pulling in a full markdown library for a handful
- * of formatting cases, and never uses dangerouslySetInnerHTML.
- */
 function renderInlineSpans(text: string, keyPrefix: string) {
   const parts = text.split(/(\*\*[^*]+\*\*)/g);
   return parts.map((part, i) => {
@@ -88,9 +81,12 @@ export default function Home() {
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<QueryResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [askedOnce, setAskedOnce] = useState(false);
   const [elapsedMs, setElapsedMs] = useState<number | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  // Guards against an older, slower request overwriting a newer result.
+  const requestIdRef = useRef(0);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -107,22 +103,53 @@ export default function Home() {
 
   async function ask(q?: string) {
     const finalQuery = (q ?? query).trim();
-    if (!finalQuery) return;
+    if (!finalQuery || loading) return;
+
+    const thisRequestId = ++requestIdRef.current;
+
     setQuery(finalQuery);
     setLoading(true);
+    setError(null);
     setAskedOnce(true);
     const start = performance.now();
+
     try {
       const res = await fetch("/api/query", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: finalQuery, top_k: 3 }),
       });
+
+      if (thisRequestId !== requestIdRef.current) return; // stale response
+
+      if (!res.ok) {
+        let message = `Request failed (${res.status})`;
+        try {
+          const errBody = await res.json();
+          if (errBody?.error) message = errBody.error;
+        } catch {
+          // response wasn't JSON — keep the generic message
+        }
+        setError(message);
+        setResult(null);
+        return;
+      }
+
       const data = await res.json();
+      if (thisRequestId !== requestIdRef.current) return; // stale response
+
       setElapsedMs(Math.round(performance.now() - start));
       setResult(data);
+    } catch (err) {
+      if (thisRequestId !== requestIdRef.current) return;
+      setError(
+        err instanceof Error
+          ? `Couldn't reach the server: ${err.message}`
+          : "Couldn't reach the server. Check your connection and try again."
+      );
+      setResult(null);
     } finally {
-      setLoading(false);
+      if (thisRequestId === requestIdRef.current) setLoading(false);
     }
   }
 
@@ -180,10 +207,11 @@ export default function Home() {
                 ref={inputRef}
                 type="text"
                 value={query}
+                disabled={loading}
                 onChange={(e) => setQuery(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && ask()}
                 placeholder="Ask a question…"
-                className="flex-1 min-w-0 bg-transparent outline-none text-[13px] sm:text-[14.5px] placeholder:text-[#B4AFC4] text-[#161221] py-2.5 sm:py-3"
+                className="flex-1 min-w-0 bg-transparent outline-none text-[13px] sm:text-[14.5px] placeholder:text-[#B4AFC4] text-[#161221] py-2.5 sm:py-3 disabled:opacity-60"
               />
               {!query && (
                 <kbd className="hidden md:flex items-center gap-0.5 text-[10.5px] text-[#948FA3] border border-[#E7E3F0] rounded-md px-1.5 py-0.5 shrink-0">
@@ -192,7 +220,7 @@ export default function Home() {
               )}
               <button
                 onClick={() => ask()}
-                disabled={loading}
+                disabled={loading || !query.trim()}
                 className="shrink-0 text-[12.5px] sm:text-[13px] font-medium text-white bg-[#5B3DF5] hover:bg-[#4C2FE0] active:scale-[0.97] disabled:opacity-40 disabled:hover:bg-[#5B3DF5] rounded-xl px-3.5 sm:px-4.5 py-2 sm:py-2.5 transition-all"
               >
                 {loading ? (
@@ -214,7 +242,8 @@ export default function Home() {
               <button
                 key={ex}
                 onClick={() => ask(ex)}
-                className="text-[11.5px] text-[#6D6784] bg-white hover:text-[#5B3DF5] hover:border-[#DCD4FB] border border-[#E7E3F0] rounded-full px-3 py-1.5 transition-colors"
+                disabled={loading}
+                className="text-[11.5px] text-[#6D6784] bg-white hover:text-[#5B3DF5] hover:border-[#DCD4FB] border border-[#E7E3F0] rounded-full px-3 py-1.5 transition-colors disabled:opacity-50"
               >
                 {ex}
               </button>
@@ -238,8 +267,22 @@ export default function Home() {
             </div>
           )}
 
+          {/* Error state */}
+          {error && !loading && (
+            <div className="max-w-[720px] mx-auto mb-6 bg-[#FDF1F1] border border-[#F3C9C9] rounded-2xl px-4 py-3 flex items-start gap-3">
+              <span className="text-[#C23B3B] text-[13px] font-semibold shrink-0">Error</span>
+              <span className="text-[13px] text-[#8A2E2E] leading-relaxed">{error}</span>
+              <button
+                onClick={() => ask(query)}
+                className="ml-auto shrink-0 text-[12px] font-medium text-[#5B3DF5] hover:underline"
+              >
+                Retry
+              </button>
+            </div>
+          )}
+
           {/* Result — two column on wide screens */}
-          {result && !loading && (
+          {result && !loading && !error && (
             <div key={result.query} className="grid lg:grid-cols-[1.6fr_1fr] gap-x-8 gap-y-6">
               <div className="bg-white border border-[#E7E3F0] rounded-2xl p-4 xs:p-5 sm:p-6 shadow-[0_1px_2px_rgba(22,18,33,0.04)]">
                 <div className="flex items-center justify-between mb-3">
@@ -259,35 +302,41 @@ export default function Home() {
                 <div className="text-[10.5px] font-semibold tracking-[0.08em] uppercase text-[#948FA3] mb-2.5 px-1">
                   Sources
                 </div>
-                <div className="flex flex-col gap-2">
-                  {result.sources.map((s, i) => (
-                    <div
-                      key={i}
-                      className="group flex items-start gap-3 bg-white border border-[#E7E3F0] hover:border-[#DCD4FB] rounded-xl px-3.5 py-3 transition-colors"
-                    >
-                      <span className="text-[10.5px] font-semibold text-[#B4AFC4] group-hover:text-[#5B3DF5] pt-0.5 shrink-0 w-4 transition-colors">
-                        {String(i + 1).padStart(2, "0")}
-                      </span>
-                      <div className="flex-1 min-w-0">
-                        <div className="text-[13px] font-medium text-[#161221] mb-0.5 truncate">
-                          {s.title}
-                        </div>
-                        <div className="text-[11px] text-[#948FA3] truncate">{s.source}</div>
-                      </div>
-                      <div className="shrink-0 flex items-center gap-2 pt-1">
-                        <div className="hidden xs:block w-8 h-[3px] rounded-full bg-[#F1EEF9] overflow-hidden">
-                          <div
-                            className="h-full bg-[#5B3DF5] transition-all duration-700 ease-out"
-                            style={{ width: `${Math.min(100, s.score * 200)}%` }}
-                          />
-                        </div>
-                        <span className="text-[10.5px] text-[#948FA3] w-6 text-right">
-                          {s.score.toFixed(2)}
+                {result.sources.length === 0 ? (
+                  <div className="text-[12px] text-[#B4AFC4] bg-white border border-[#E7E3F0] rounded-xl px-3.5 py-3">
+                    No matching sources found.
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-2">
+                    {result.sources.map((s, i) => (
+                      <div
+                        key={i}
+                        className="group flex items-start gap-3 bg-white border border-[#E7E3F0] hover:border-[#DCD4FB] rounded-xl px-3.5 py-3 transition-colors"
+                      >
+                        <span className="text-[10.5px] font-semibold text-[#B4AFC4] group-hover:text-[#5B3DF5] pt-0.5 shrink-0 w-4 transition-colors">
+                          {String(i + 1).padStart(2, "0")}
                         </span>
+                        <div className="flex-1 min-w-0">
+                          <div className="text-[13px] font-medium text-[#161221] mb-0.5 truncate">
+                            {s.title}
+                          </div>
+                          <div className="text-[11px] text-[#948FA3] truncate">{s.source}</div>
+                        </div>
+                        <div className="shrink-0 flex items-center gap-2 pt-1">
+                          <div className="hidden xs:block w-8 h-[3px] rounded-full bg-[#F1EEF9] overflow-hidden">
+                            <div
+                              className="h-full bg-[#5B3DF5] transition-all duration-700 ease-out"
+                              style={{ width: `${Math.min(100, s.score * 200)}%` }}
+                            />
+                          </div>
+                          <span className="text-[10.5px] text-[#948FA3] w-6 text-right">
+                            {s.score.toFixed(2)}
+                          </span>
+                        </div>
                       </div>
-                    </div>
-                  ))}
-                </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           )}
